@@ -1,0 +1,600 @@
+"""
+ALL-IN-ONE OPTIMIZED TRAINING SCRIPT
+Complete standalone script - no dependencies on previous modules
+Works even after Colab restart!
+
+This script includes:
+1. Data loading from Google Drive
+2. All model definitions (including enhanced versions)
+3. Training functions with knowledge distillation
+4. Complete evaluation and comparison
+
+Just run this single script!
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from pathlib import Path
+import h5py
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score, precision_score, recall_score, accuracy_score, roc_auc_score, confusion_matrix
+import time
+import json
+import warnings
+warnings.filterwarnings("ignore")
+
+print("=" * 100)
+print("ALL-IN-ONE OPTIMIZED TRAINING SCRIPT")
+print("=" * 100)
+print()
+
+# ============= STEP 1: Mount Google Drive =============
+print("Step 1: Mounting Google Drive...")
+from google.colab import drive
+drive.mount("/content/drive")
+print("✓ Google Drive mounted")
+print()
+
+# ============= STEP 2: Configuration =============
+class Config:
+    # Data paths
+    BASE_PATH = "/content/drive/MyDrive/CNC_Machining/data"
+    
+    # Data parameters
+    WINDOW_SIZE = 2000
+    STRIDE = 1000
+    MAX_FILES_PER_FOLDER_GOOD = 50
+    MAX_FILES_PER_FOLDER_BAD = 50
+    BATCH_SIZE = 128
+    
+    # Training parameters
+    EPOCHS = 30
+    LEARNING_RATE = 1e-3
+    WEIGHT_DECAY = 1e-4
+    EARLY_STOPPING_PATIENCE = 7
+    
+    # Knowledge Distillation
+    KD_TEMPERATURE = 2.0
+    KD_ALPHA = 0.7
+    
+    # Device
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Random seed
+    RANDOM_SEED = 42
+
+config = Config()
+
+print("Configuration:")
+print(f"  Device: {config.DEVICE}")
+if torch.cuda.is_available():
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+print(f"  Epochs: {config.EPOCHS}")
+print(f"  Batch Size: {config.BATCH_SIZE}")
+print()
+
+# ============= STEP 3: Data Loading =============
+print("=" * 100)
+print("STEP 3: Loading Data")
+print("=" * 100)
+print()
+
+class CNCH5DataLoader:
+    def __init__(self, config):
+        self.config = config
+        self.base_path = Path(config.BASE_PATH)
+        self.scaler = StandardScaler()
+    
+    def load_h5_file(self, h5_path):
+        try:
+            with h5py.File(h5_path, "r") as f:
+                if "vibration_data" in f.keys():
+                    data = f["vibration_data"][:]
+                    if len(data.shape) == 2 and data.shape[1] >= 3:
+                        return data[:, :3].astype(np.float32)
+                return None
+        except:
+            return None
+    
+    def load_experiment_folder(self, exp_folder):
+        exp_path = self.base_path / exp_folder
+        if not exp_path.exists():
+            return None, None
+        
+        print(f"Loading {exp_folder}...")
+        h5_files = list(exp_path.rglob("*.h5"))
+        
+        good_files = [f for f in h5_files if "bad" not in str(f).lower() and "worn" not in str(f).lower()]
+        bad_files = [f for f in h5_files if "bad" in str(f).lower() or "worn" in str(f).lower()]
+        
+        print(f"  Found {len(good_files)} good, {len(bad_files)} bad files")
+        
+        np.random.seed(self.config.RANDOM_SEED)
+        if len(good_files) > self.config.MAX_FILES_PER_FOLDER_GOOD:
+            good_files = list(np.random.choice(good_files, self.config.MAX_FILES_PER_FOLDER_GOOD, replace=False))
+        if len(bad_files) > self.config.MAX_FILES_PER_FOLDER_BAD:
+            bad_files = list(np.random.choice(bad_files, self.config.MAX_FILES_PER_FOLDER_BAD, replace=False))
+        
+        all_signals, all_labels = [], []
+        for h5_file in good_files:
+            signals = self.load_h5_file(h5_file)
+            if signals is not None:
+                all_signals.append(signals)
+                all_labels.append(np.zeros(len(signals)))
+        
+        for h5_file in bad_files:
+            signals = self.load_h5_file(h5_file)
+            if signals is not None:
+                all_signals.append(signals)
+                all_labels.append(np.ones(len(signals)))
+        
+        if not all_signals:
+            return None, None
+        
+        combined_signals = np.vstack(all_signals)
+        combined_labels = np.hstack(all_labels)
+        print(f"  Loaded {len(combined_labels)} samples")
+        
+        return combined_signals, combined_labels.astype(int)
+    
+    def create_windows(self, signals, labels):
+        if len(signals) < self.config.WINDOW_SIZE:
+            return np.array([]), np.array([])
+        
+        windows, window_labels = [], []
+        for i in range(0, len(signals) - self.config.WINDOW_SIZE + 1, self.config.STRIDE):
+            window = signals[i:i + self.config.WINDOW_SIZE]
+            window_label = int(np.mean(labels[i:i + self.config.WINDOW_SIZE]) > 0.3)
+            windows.append(window)
+            window_labels.append(window_label)
+        
+        return np.array(windows), np.array(window_labels)
+    
+    def load_all_data(self):
+        all_windows, all_labels = [], []
+        
+        for exp_folder in ["M01", "M02", "M03"]:
+            signals, labels = self.load_experiment_folder(exp_folder)
+            if signals is not None:
+                windows, window_labels = self.create_windows(signals, labels)
+                if len(windows) > 0:
+                    all_windows.append(windows)
+                    all_labels.append(window_labels)
+                    print(f"  Created {len(windows)} windows")
+        
+        X = np.vstack(all_windows)
+        y = np.hstack(all_labels)
+        
+        print(f"\nTotal: {len(X)} samples, {np.sum(y)} anomalies ({100*np.sum(y)/len(y):.1f}%)")
+        
+        # Normalize
+        X_reshaped = X.reshape(-1, 3)
+        X_normalized = self.scaler.fit_transform(X_reshaped)
+        X = X_normalized.reshape(-1, self.config.WINDOW_SIZE, 3)
+        
+        # Split
+        y = y.astype(int)
+        X_temp, X_test, y_temp, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=config.RANDOM_SEED)
+        X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.1875, stratify=y_temp, random_state=config.RANDOM_SEED)
+        
+        print(f"Split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
+        print()
+        
+        return (X_train, y_train), (X_val, y_val), (X_test, y_test)
+
+# Load data
+loader = CNCH5DataLoader(config)
+(X_train, y_train), (X_val, y_val), (X_test, y_test) = loader.load_all_data()
+
+# Create PyTorch datasets
+class CNCDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.LongTensor(y)
+    
+    def __len__(self):
+        return len(self.y)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+train_dataset = CNCDataset(X_train, y_train)
+val_dataset = CNCDataset(X_val, y_val)
+test_dataset = CNCDataset(X_test, y_test)
+
+# Weighted sampling
+class_counts = np.bincount(y_train.astype(int))
+class_weights = 1.0 / class_counts
+sample_weights = class_weights[y_train.astype(int)]
+
+sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, sampler=sampler, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
+
+print("✓ Data loaders created")
+print()
+
+# ============= STEP 4: Model Definitions =============
+print("=" * 100)
+print("STEP 4: Defining Models")
+print("=" * 100)
+print()
+
+# MobileNetV2 (Teacher)
+class InvertedResidual(nn.Module):
+    def __init__(self, inp, oup, stride, expand_ratio):
+        super().__init__()
+        self.stride = stride
+        hidden_dim = int(inp * expand_ratio)
+        self.use_res_connect = self.stride == 1 and inp == oup
+
+        layers = []
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv1d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU6(inplace=True)
+            ])
+        
+        layers.extend([
+            nn.Conv1d(hidden_dim, hidden_dim, 3, stride, 1, groups=hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU6(inplace=True),
+            nn.Conv1d(hidden_dim, oup, 1, 1, 0, bias=False),
+            nn.BatchNorm1d(oup)
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        if self.use_res_connect:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+class MobileNetV2Detector(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        self.conv1 = nn.Sequential(
+            nn.Conv1d(3, 16, 3, 2, 1, bias=False),
+            nn.BatchNorm1d(16),
+            nn.ReLU6(inplace=True)
+        )
+        
+        self.blocks = nn.Sequential(
+            InvertedResidual(16, 16, 1, 1),
+            InvertedResidual(16, 24, 2, 6),
+            InvertedResidual(24, 24, 1, 6),
+            InvertedResidual(24, 32, 2, 6)
+        )
+        
+        self.conv2 = nn.Sequential(
+            nn.Conv1d(32, 64, 1, 1, 0, bias=False),
+            nn.BatchNorm1d(64),
+            nn.ReLU6(inplace=True)
+        )
+        
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(64, 2)
+        )
+    
+    def forward(self, x):
+        x = x.transpose(1, 2)
+        x = self.conv1(x)
+        x = self.blocks(x)
+        x = self.conv2(x)
+        return self.classifier(x)
+
+# Enhanced Nano V1 (Lightweight)
+class EnhancedNanoV1(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(3, 48, num_layers=2, batch_first=True, dropout=0.2)
+        self.projection = nn.Linear(48, 48)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=48, nhead=4, dim_feedforward=48, dropout=0.1, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.classifier = nn.Sequential(nn.Linear(96, 24), nn.ReLU(), nn.Dropout(0.3), nn.Linear(24, 2))
+    
+    def forward(self, x):
+        gru_out, h_n = self.gru(x)
+        trans_in = self.projection(gru_out)
+        trans_out = self.transformer(trans_in)
+        trans_pooled = trans_out.mean(dim=1)
+        combined = torch.cat([h_n[-1], trans_pooled], dim=1)
+        return self.classifier(combined)
+
+# Enhanced Nano V2 (Balanced)
+class EnhancedNanoV2(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(3, 56, num_layers=2, batch_first=True, dropout=0.2)
+        self.projection = nn.Linear(56, 64)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, dim_feedforward=64, dropout=0.15, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.classifier = nn.Sequential(nn.Linear(120, 32), nn.ReLU(), nn.Dropout(0.3), nn.Linear(32, 2))
+    
+    def forward(self, x):
+        gru_out, h_n = self.gru(x)
+        trans_in = self.projection(gru_out)
+        trans_out = self.transformer(trans_in)
+        trans_pooled = trans_out.mean(dim=1)
+        combined = torch.cat([h_n[-1], trans_pooled], dim=1)
+        return self.classifier(combined)
+
+print("✓ Models defined")
+print()
+
+# ============= STEP 5: Training Functions =============
+def train_epoch(model, train_loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0
+    for batch_x, batch_y in train_loader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        outputs = model(batch_x)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    return total_loss / len(train_loader)
+
+def train_epoch_with_kd(student_model, teacher_model, train_loader, optimizer, device, temperature, alpha):
+    student_model.train()
+    teacher_model.eval()
+    ce_criterion = nn.CrossEntropyLoss()
+    kl_criterion = nn.KLDivLoss(reduction="batchmean")
+    total_loss = 0
+    
+    for batch_x, batch_y in train_loader:
+        batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        
+        student_outputs = student_model(batch_x)
+        with torch.no_grad():
+            teacher_outputs = teacher_model(batch_x)
+        
+        ce_loss = ce_criterion(student_outputs, batch_y)
+        student_soft = F.log_softmax(student_outputs / temperature, dim=1)
+        teacher_soft = F.softmax(teacher_outputs / temperature, dim=1)
+        kd_loss = kl_criterion(student_soft, teacher_soft) * (temperature ** 2)
+        
+        loss = alpha * kd_loss + (1 - alpha) * ce_loss
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    
+    return total_loss / len(train_loader)
+
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds, all_labels = [], []
+    
+    with torch.no_grad():
+        for batch_x, batch_y in val_loader:
+            batch_x, batch_y = batch_x.to(device), batch_y.to(device)
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            preds = torch.argmax(outputs, dim=1)
+            total_loss += loss.item()
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch_y.cpu().numpy())
+    
+    avg_loss = total_loss / len(val_loader)
+    val_f1 = f1_score(all_labels, all_preds, average="binary")
+    return avg_loss, val_f1
+
+def train_model(model, train_loader, val_loader, config, use_kd=False, teacher_model=None, model_name="Model"):
+    device = torch.device(config.DEVICE)
+    model = model.to(device)
+    
+    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.EPOCHS)
+    criterion = nn.CrossEntropyLoss()
+    
+    if use_kd and teacher_model:
+        teacher_model = teacher_model.to(device)
+        teacher_model.eval()
+    
+    best_val_f1, best_model_state, patience_counter = 0, None, 0
+    
+    print(f"\nTraining: {model_name}")
+    start_time = time.time()
+    
+    for epoch in range(config.EPOCHS):
+        if use_kd and teacher_model:
+            train_loss = train_epoch_with_kd(model, teacher_model, train_loader, optimizer, device, config.KD_TEMPERATURE, config.KD_ALPHA)
+        else:
+            train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        
+        val_loss, val_f1 = validate(model, val_loader, criterion, device)
+        scheduler.step()
+        
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            best_model_state = model.state_dict().copy()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if (epoch + 1) % 5 == 0:
+            print(f"Epoch {epoch+1:3d}/{config.EPOCHS}: Train Loss={train_loss:.4f}, Val F1={val_f1:.4f}, Best={best_val_f1:.4f}")
+        
+        if patience_counter >= config.EARLY_STOPPING_PATIENCE:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+    
+    training_time = time.time() - start_time
+    model.load_state_dict(best_model_state)
+    print(f"Training completed in {training_time:.1f}s, Best Val F1: {best_val_f1:.4f}")
+    
+    return model, best_val_f1, training_time
+
+def evaluate_model(model, test_loader, device):
+    model.eval()
+    model = model.to(device)
+    all_preds, all_labels, all_probs = [], [], []
+    inference_times = []
+    
+    with torch.no_grad():
+        for batch_x, batch_y in test_loader:
+            batch_x = batch_x.to(device)
+            start_time = time.time()
+            outputs = model(batch_x)
+            inference_time = (time.time() - start_time) / batch_x.size(0) * 1000
+            inference_times.append(inference_time)
+            
+            probs = F.softmax(outputs, dim=1)
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(batch_y.numpy())
+            all_probs.extend(probs[:, 1].cpu().numpy())
+    
+    return {
+        "accuracy": accuracy_score(all_labels, all_preds),
+        "precision": precision_score(all_labels, all_preds, average="binary", zero_division=0),
+        "recall": recall_score(all_labels, all_preds, average="binary", zero_division=0),
+        "f1_score": f1_score(all_labels, all_preds, average="binary", zero_division=0),
+        "auc_roc": roc_auc_score(all_labels, all_probs),
+        "inference_time_ms": np.mean(inference_times),
+        "parameters": sum(p.numel() for p in model.parameters())
+    }
+
+# ============= STEP 6: Train Teacher Model =============
+print("=" * 100)
+print("STEP 6: Training Teacher Model (MobileNetV2)")
+print("=" * 100)
+
+teacher = MobileNetV2Detector()
+print(f"Teacher parameters: {sum(p.numel() for p in teacher.parameters()):,}")
+
+# Try to load pre-trained teacher
+teacher_path = "/content/drive/MyDrive/CNC_Machining/models/MobileNetV2-Detector.pth"
+try:
+    teacher.load_state_dict(torch.load(teacher_path))
+    print(f"✓ Loaded pre-trained teacher from {teacher_path}")
+    teacher_metrics = {"f1_score": 0.9960}  # From previous training
+except:
+    print("Training teacher model from scratch...")
+    teacher, _, teacher_time = train_model(teacher, train_loader, val_loader, config, use_kd=False, model_name="MobileNetV2 (Teacher)")
+    teacher_metrics = evaluate_model(teacher, test_loader, config.DEVICE)
+    print(f"Teacher F1: {teacher_metrics['f1_score']:.4f}")
+    
+    # Save teacher
+    import os
+    os.makedirs("/content/drive/MyDrive/CNC_Machining/models", exist_ok=True)
+    torch.save(teacher.state_dict(), teacher_path)
+    print(f"✓ Teacher saved to {teacher_path}")
+
+teacher.eval()
+for param in teacher.parameters():
+    param.requires_grad = False
+
+print()
+
+# ============= STEP 7: Train Student Models =============
+print("=" * 100)
+print("STEP 7: Training Student Models with Optimized KD")
+print("=" * 100)
+print()
+
+results = {}
+
+# Configuration 1: EnhancedNanoV1 with KD
+print("\n" + "=" * 60)
+print("Configuration 1: EnhancedNanoV1 with KD")
+print("=" * 60)
+model1 = EnhancedNanoV1()
+print(f"Parameters: {sum(p.numel() for p in model1.parameters()):,}")
+model1, _, time1 = train_model(model1, train_loader, val_loader, config, use_kd=True, teacher_model=teacher, model_name="EnhancedNanoV1-KD")
+metrics1 = evaluate_model(model1, test_loader, config.DEVICE)
+results["EnhancedNanoV1-KD"] = {"metrics": metrics1, "time": time1}
+print(f"✓ F1={metrics1['f1_score']:.4f}, Inference={metrics1['inference_time_ms']:.2f}ms")
+
+# Configuration 2: EnhancedNanoV1 without KD (baseline)
+print("\n" + "=" * 60)
+print("Configuration 2: EnhancedNanoV1 without KD (Baseline)")
+print("=" * 60)
+model2 = EnhancedNanoV1()
+model2, _, time2 = train_model(model2, train_loader, val_loader, config, use_kd=False, model_name="EnhancedNanoV1-NoKD")
+metrics2 = evaluate_model(model2, test_loader, config.DEVICE)
+results["EnhancedNanoV1-NoKD"] = {"metrics": metrics2, "time": time2}
+print(f"✓ F1={metrics2['f1_score']:.4f}, Inference={metrics2['inference_time_ms']:.2f}ms")
+
+# Configuration 3: EnhancedNanoV2 with KD
+print("\n" + "=" * 60)
+print("Configuration 3: EnhancedNanoV2 with KD")
+print("=" * 60)
+model3 = EnhancedNanoV2()
+print(f"Parameters: {sum(p.numel() for p in model3.parameters()):,}")
+model3, _, time3 = train_model(model3, train_loader, val_loader, config, use_kd=True, teacher_model=teacher, model_name="EnhancedNanoV2-KD")
+metrics3 = evaluate_model(model3, test_loader, config.DEVICE)
+results["EnhancedNanoV2-KD"] = {"metrics": metrics3, "time": time3}
+print(f"✓ F1={metrics3['f1_score']:.4f}, Inference={metrics3['inference_time_ms']:.2f}ms")
+
+# ============= STEP 8: Results Summary =============
+print("\n" + "=" * 100)
+print("FINAL RESULTS")
+print("=" * 100)
+print()
+
+comparison_data = []
+for name, data in results.items():
+    m = data["metrics"]
+    comparison_data.append({
+        "Model": name,
+        "Parameters": m["parameters"],
+        "F1-Score": m["f1_score"],
+        "Precision": m["precision"],
+        "Recall": m["recall"],
+        "AUC-ROC": m["auc_roc"],
+        "Inference (ms)": m["inference_time_ms"],
+        "Training Time (s)": data["time"]
+    })
+
+df = pd.DataFrame(comparison_data)
+df = df.sort_values("F1-Score", ascending=False)
+
+print(df.to_string(index=False))
+print()
+
+# Best model
+best = df.iloc[0]
+print("=" * 100)
+print("BEST MODEL")
+print("=" * 100)
+print(f"Model: {best['Model']}")
+print(f"Parameters: {best['Parameters']:,}")
+print(f"F1-Score: {best['F1-Score']:.4f}")
+print(f"Improvement over old Nano (0.9370): {(best['F1-Score'] - 0.9370) * 100:+.2f}%")
+print()
+
+# Comparison with teacher
+teacher_f1 = teacher_metrics.get("f1_score", 0.9960)
+print(f"Teacher (MobileNetV2) F1: {teacher_f1:.4f}")
+print(f"Gap to teacher: {(best['F1-Score'] - teacher_f1) * 100:.2f}%")
+print(f"Parameter reduction vs teacher: {24514 / best['Parameters']:.1f}x smaller")
+print()
+
+# Save results
+import os
+os.makedirs("/content/drive/MyDrive/CNC_Machining/results_optimized", exist_ok=True)
+csv_path = "/content/drive/MyDrive/CNC_Machining/results_optimized/standalone_results.csv"
+df.to_csv(csv_path, index=False)
+print(f"✓ Results saved to {csv_path}")
+print()
+
+print("=" * 100)
+print("OPTIMIZATION COMPLETE!")
+print("=" * 100)

@@ -1,0 +1,314 @@
+import os
+import h5py
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from collections import defaultdict
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置matplotlib中文显示
+plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+class CNCDataExplorer:
+    """博世CNC数据集探索工具"""
+
+    def __init__(self, data_path="/content/drive/MyDrive/CNC_Machining/data"):
+        """
+        初始化数据探索器
+
+        Args:
+            data_path: 数据集根目录路径
+        """
+        self.data_path = Path(data_path)
+        self.data_info = defaultdict(lambda: defaultdict(dict))
+        self.file_list = []
+
+    def scan_dataset(self):
+        """扫描整个数据集结构"""
+        print("="*80)
+        print("博世CNC数据集结构扫描")
+        print("="*80)
+
+        total_files = 0
+        total_good = 0
+        total_bad = 0
+
+        # 扫描所有机器
+        machines = sorted([d for d in os.listdir(self.data_path)
+                          if os.path.isdir(os.path.join(self.data_path, d))])
+
+        print(f"发现 {len(machines)} 台机器: {machines}\n")
+
+        for machine in machines:
+            machine_path = self.data_path / machine
+            processes = sorted([d for d in os.listdir(machine_path)
+                               if os.path.isdir(os.path.join(machine_path, d))])
+
+            print(f"\n机器 {machine}:")
+            print(f"  - 工序数量: {len(processes)}")
+
+            machine_good = 0
+            machine_bad = 0
+
+            for process in processes:
+                process_path = machine_path / process
+
+                # 统计good和bad样本
+                good_path = process_path / "good"
+                bad_path = process_path / "bad"
+
+                good_files = []
+                bad_files = []
+
+                if good_path.exists():
+                    good_files = [f for f in os.listdir(good_path) if f.endswith('.h5')]
+                    machine_good += len(good_files)
+
+                if bad_path.exists():
+                    bad_files = [f for f in os.listdir(bad_path) if f.endswith('.h5')]
+                    machine_bad += len(bad_files)
+
+                # 保存信息
+                self.data_info[machine][process] = {
+                    'good': len(good_files),
+                    'bad': len(bad_files),
+                    'total': len(good_files) + len(bad_files)
+                }
+
+                # 收集文件列表
+                for f in good_files:
+                    self.file_list.append({
+                        'machine': machine,
+                        'process': process,
+                        'label': 'good',
+                        'filename': f,
+                        'path': str(good_path / f)
+                    })
+                for f in bad_files:
+                    self.file_list.append({
+                        'machine': machine,
+                        'process': process,
+                        'label': 'bad',
+                        'filename': f,
+                        'path': str(bad_path / f)
+                    })
+
+            print(f"  - 正常样本: {machine_good}")
+            print(f"  - 异常样本: {machine_bad}")
+            print(f"  - 总样本数: {machine_good + machine_bad}")
+
+            total_good += machine_good
+            total_bad += machine_bad
+            total_files += machine_good + machine_bad
+
+        print("\n" + "="*80)
+        print("数据集汇总统计")
+        print("="*80)
+        print(f"总文件数: {total_files}")
+        print(f"正常样本: {total_good} ({total_good/total_files*100:.1f}%)")
+        print(f"异常样本: {total_bad} ({total_bad/total_files*100:.1f}%)")
+        print(f"样本不平衡比例: 1:{total_good/max(total_bad, 1):.2f} (异常:正常)")
+
+        return self.data_info
+
+    def analyze_sample_file(self, sample_index=0):
+        """分析单个样本文件的详细信息"""
+        if not self.file_list:
+            print("请先运行 scan_dataset() 方法")
+            return
+
+        sample = self.file_list[sample_index]
+
+        print("\n" + "="*80)
+        print("样本文件详细分析")
+        print("="*80)
+        print(f"文件: {sample['filename']}")
+        print(f"机器: {sample['machine']}")
+        print(f"工序: {sample['process']}")
+        print(f"标签: {sample['label']}")
+
+        # 读取H5文件
+        with h5py.File(sample['path'], 'r') as f:
+            # 获取所有键
+            keys = list(f.keys())
+            print(f"\nH5文件包含的键: {keys}")
+
+            # 读取振动数据
+            if 'vibration_data' in keys:
+                data = f['vibration_data'][:]
+            else:
+                # 尝试其他可能的键名
+                data = f[keys[0]][:]
+
+            print(f"\n数据形状: {data.shape}")
+            print(f"数据类型: {data.dtype}")
+            print(f"采样点数: {data.shape[0]}")
+            print(f"通道数: {data.shape[1]} (X, Y, Z轴)")
+            print(f"采样率: 2000 Hz")
+            print(f"时长: {data.shape[0]/2000:.2f} 秒")
+
+            # 统计信息
+            print("\n各轴统计信息:")
+            axes = ['X轴', 'Y轴', 'Z轴']
+            for i, axis in enumerate(axes):
+                print(f"\n{axis}:")
+                print(f"  - 均值: {np.mean(data[:, i]):.6f}")
+                print(f"  - 标准差: {np.std(data[:, i]):.6f}")
+                print(f"  - 最小值: {np.min(data[:, i]):.6f}")
+                print(f"  - 最大值: {np.max(data[:, i]):.6f}")
+                print(f"  - 峰峰值: {np.ptp(data[:, i]):.6f}")
+
+            return data
+
+    def visualize_sample(self, sample_index=0, time_window=1.0):
+        """可视化样本数据"""
+        if not self.file_list:
+            print("请先运行 scan_dataset() 方法")
+            return
+
+        sample = self.file_list[sample_index]
+
+        # 读取数据
+        with h5py.File(sample['path'], 'r') as f:
+            keys = list(f.keys())
+            if 'vibration_data' in keys:
+                data = f['vibration_data'][:]
+            else:
+                data = f[keys[0]][:]
+
+        # 创建时间轴
+        sampling_rate = 2000
+        time = np.arange(len(data)) / sampling_rate
+
+        # 选择显示的时间窗口
+        window_samples = int(time_window * sampling_rate)
+        display_data = data[:window_samples]
+        display_time = time[:window_samples]
+
+        # 绘图
+        fig, axes = plt.subplots(3, 1, figsize=(15, 10))
+        axis_names = ['X-axis', 'Y-axis', 'Z-axis']
+        colors = ['blue', 'green', 'red']
+
+        for i, (ax, name, color) in enumerate(zip(axes, axis_names, colors)):
+            ax.plot(display_time, display_data[:, i], color=color, linewidth=0.5)
+            ax.set_ylabel(f'{name} Acceleration', fontsize=10)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim([0, time_window])
+
+            # 添加统计信息
+            stats_text = f'Mean: {np.mean(display_data[:, i]):.3f}, Std: {np.std(display_data[:, i]):.3f}'
+            ax.text(0.02, 0.95, stats_text, transform=ax.transAxes,
+                   bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+        axes[-1].set_xlabel('Time (s)', fontsize=12)
+
+        plt.suptitle(f'Vibration Data Visualization\n'
+                    f'Machine: {sample["machine"]}, Process: {sample["process"]}, '
+                    f'Label: {sample["label"]}', fontsize=14)
+        plt.tight_layout()
+        plt.show()
+
+    def create_dataset_summary(self):
+        """创建数据集汇总表"""
+        if not self.data_info:
+            print("请先运行 scan_dataset() 方法")
+            return
+
+        # 创建汇总DataFrame
+        summary_data = []
+        for machine in self.data_info:
+            for process in self.data_info[machine]:
+                summary_data.append({
+                    'Machine': machine,
+                    'Process': process,
+                    'Good': self.data_info[machine][process]['good'],
+                    'Bad': self.data_info[machine][process]['bad'],
+                    'Total': self.data_info[machine][process]['total']
+                })
+
+        df = pd.DataFrame(summary_data)
+
+        # 创建热力图
+        pivot_good = df.pivot(index='Process', columns='Machine', values='Good')
+        pivot_bad = df.pivot(index='Process', columns='Machine', values='Bad')
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+
+        # 正常样本热力图
+        sns.heatmap(pivot_good, annot=True, fmt='d', cmap='Greens',
+                   ax=ax1, cbar_kws={'label': 'Sample Count'})
+        ax1.set_title('Normal Samples Distribution', fontsize=14)
+
+        # 异常样本热力图
+        sns.heatmap(pivot_bad, annot=True, fmt='d', cmap='Reds',
+                   ax=ax2, cbar_kws={'label': 'Sample Count'})
+        ax2.set_title('Anomaly Samples Distribution', fontsize=14)
+
+        plt.suptitle('CNC Dataset Sample Distribution', fontsize=16)
+        plt.tight_layout()
+        plt.show()
+
+        return df
+
+    def get_time_distribution(self):
+        """分析数据的时间分布"""
+        time_frames = defaultdict(int)
+
+        for file_info in self.file_list:
+            filename = file_info['filename']
+            # 从文件名提取时间信息 (例如: M02_Aug_2019_OP03_000.h5)
+            parts = filename.split('_')
+            if len(parts) >= 3:
+                time_frame = f"{parts[1]}_{parts[2]}"
+                time_frames[time_frame] += 1
+
+        if time_frames:
+            print("\n" + "="*80)
+            print("数据时间分布")
+            print("="*80)
+            for time_frame, count in sorted(time_frames.items()):
+                print(f"{time_frame}: {count} 个文件")
+
+        return dict(time_frames)
+
+# 使用示例
+def main():
+    """主函数：执行数据集探索"""
+
+    # 初始化探索器
+    explorer = CNCDataExplorer("/content/drive/MyDrive/CNC_Machining/data")
+
+    # 1. 扫描数据集结构
+    print("步骤 1: 扫描数据集结构")
+    data_info = explorer.scan_dataset()
+
+    # 2. 分析样本文件
+    print("\n\n步骤 2: 分析样本文件")
+    sample_data = explorer.analyze_sample_file(sample_index=0)
+
+    # 3. 可视化样本
+    print("\n步骤 3: 可视化振动数据")
+    explorer.visualize_sample(sample_index=0, time_window=1.0)
+
+    # 4. 创建汇总表和热力图
+    print("\n步骤 4: 创建数据分布热力图")
+    summary_df = explorer.create_dataset_summary()
+
+    # 5. 分析时间分布
+    print("\n步骤 5: 分析时间分布")
+    time_dist = explorer.get_time_distribution()
+
+    print("\n" + "="*80)
+    print("数据集探索完成！")
+    print("="*80)
+
+    return explorer, summary_df
+
+# 运行主函数
+if __name__ == "__main__":
+    explorer, summary = main()
